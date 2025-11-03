@@ -1,144 +1,106 @@
 import os
-import time
-import json
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
-from tqdm import tqdm
+from time import sleep
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 load_dotenv()
 
-SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "").strip()
-COMPANY_LIMIT = int(os.getenv("COMPANY_LIMIT", "500"))
-USE_FALLBACK_HTML = os.getenv("USE_FALLBACK_HTML", "true").lower() in ("1", "true", "yes")
-DELAY_SECONDS = float(os.getenv("DELAY_SECONDS", "0.5"))
-BATCH_SAVE = int(os.getenv("BATCH_SAVE", "20"))
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 OUTPUT_CSV = "appsumo_software.csv"
+BATCH_SAVE = int(os.getenv("BATCH_SAVE", 20))
+DELAY_SECONDS = float(os.getenv("DELAY_SECONDS", 0.5))
 
 BASE_URL = "https://appsumo.com/software/"
-API_URL = "https://api.appsumo.com/products"  # hypothetical API endpoint; else we scrape HTML
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "AppSumo-Scraper/1.0 (+https://example.com)"
-})
+# Load previously fetched products to skip duplicates
+if os.path.exists(OUTPUT_CSV):
+    df_existing = pd.read_csv(OUTPUT_CSV)
+    existing_urls = set(df_existing['product_url'].tolist())
+else:
+    df_existing = pd.DataFrame()
+    existing_urls = set()
 
-def build_scraperapi_url(target_url, render=True):
-    if not SCRAPERAPI_KEY:
-        raise RuntimeError("SCRAPERAPI_KEY not set")
-    params = {"api_key": SCRAPERAPI_KEY, "url": target_url}
-    if render:
-        params["render"] = "true"
-    from urllib.parse import urlencode
-    return f"http://api.scraperapi.com/?{urlencode(params)}"
+results = []
 
 def fetch_html(url):
-    if SCRAPERAPI_KEY:
-        url = build_scraperapi_url(url)
-    resp = session.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.text
+    """Fetch HTML using ScraperAPI with JS rendering"""
+    api_url = f"http://api.scraperapi.com/?api_key={SCRAPERAPI_KEY}&url={url}&render=true"
+    response = requests.get(api_url)
+    if response.status_code != 200:
+        print(f"Error fetching {url}: {response.status_code}")
+        return None
+    return response.text
 
-def extract_founder_info(product_url):
-    try:
-        html = fetch_html(product_url)
-        soup = BeautifulSoup(html, "html.parser")
-        # Founder info might be in a section like "About the Founders" or "Created by"
-        founders = []
-        sections = soup.find_all(string=lambda s: "founder" in s.lower() or "created by" in s.lower())
-        for sec in sections:
-            parent = sec.parent
-            if parent:
-                text = parent.get_text(" ", strip=True)
-                if text:
-                    founders.append(text)
-        return "; ".join(founders)
-    except Exception as e:
-        print(f"Failed to fetch founder info for {product_url}: {e}")
-        return ""
+def parse_main_page(html):
+    """Parse main software page and return product URLs and names"""
+    soup = BeautifulSoup(html, "html.parser")
+    product_cards = soup.select("a[href*='/products/']")  # All product links
+    products = []
+    for card in product_cards:
+        product_url = "https://appsumo.com" + card['href']
+        name = card.get_text(strip=True)
+        if product_url not in existing_urls:
+            products.append({"name": name, "product_url": product_url})
+    return products
 
-def append_to_csv(data_batch):
-    df = pd.DataFrame(data_batch)
-    if os.path.exists(OUTPUT_CSV):
-        df.to_csv(OUTPUT_CSV, index=False, mode='a', header=False, encoding="utf-8-sig")
-    else:
-        df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+def parse_product_page(product_url):
+    """Fetch individual product page to get website, founder, year"""
+    html = fetch_html(product_url)
+    if not html:
+        return None, None, None
+    soup = BeautifulSoup(html, "html.parser")
 
-def main():
-    already_scraped = set()
-    if os.path.exists(OUTPUT_CSV):
-        df_existing = pd.read_csv(OUTPUT_CSV)
-        already_scraped = set(df_existing["product_name"].tolist())
+    # Extract website
+    website_tag = soup.select_one("a[href^='http']:not([href*='appsumo.com'])")
+    product_website = website_tag['href'] if website_tag else None
 
-    # Load product list from AppSumo HTML (infinite scroll handled manually with pagination)
-    products = []  # final list of dicts
-    page = 1
-    total_fetched = 0
+    # Extract founder info (may require specific selectors)
+    founder_tag = soup.select_one("div:contains('Founder')")  # update as needed
+    founder_info = founder_tag.get_text(strip=True) if founder_tag else None
 
-    while total_fetched < COMPANY_LIMIT:
-        url = f"{BASE_URL}?page={page}"
-        html = fetch_html(url)
-        soup = BeautifulSoup(html, "html.parser")
-        items = soup.select("a[data-test='product-card-link']")  # selector may vary
+    # Extract launch year if available
+    year_tag = soup.select_one("div:contains('Launched')")
+    year = year_tag.get_text(strip=True) if year_tag else None
 
-        if not items:
-            break  # no more products
+    return product_website, founder_info, year
 
-        for item in items:
-            product_name = item.get_text(strip=True)
-            product_url = item.get("href")
-            if not product_url.startswith("http"):
-                product_url = "https://appsumo.com" + product_url
+# Step 1: Fetch main page
+html = fetch_html(BASE_URL)
+if not html:
+    print("Failed to fetch main AppSumo page")
+    exit(1)
 
-            if product_name in already_scraped:
-                continue
+products_list = parse_main_page(html)
 
-            # Optional: extract product website from product page
-            website = ""
-            try:
-                product_html = fetch_html(product_url)
-                psoup = BeautifulSoup(product_html, "html.parser")
-                link_tag = psoup.select_one("a[href^='http']:not([href*='appsumo'])")
-                if link_tag:
-                    website = link_tag.get("href")
-            except:
-                pass
+# Step 2: Visit each product page
+for i, product in enumerate(tqdm(products_list, desc="Scraping products")):
+    website, founder, year = parse_product_page(product['product_url'])
+    results.append({
+        "product_name": product['name'],
+        "product_website": website,
+        "year": year,
+        "founders_info": founder,
+        "product_url": product['product_url']
+    })
+    sleep(DELAY_SECONDS)
 
-            # Year: approximate from product launch date if available
-            year = ""
-            try:
-                meta_date = psoup.find("meta", {"property": "product:release_date"})
-                if meta_date and meta_date.get("content"):
-                    year = meta_date.get("content")[:4]
-            except:
-                pass
+    # Incremental save
+    if (i + 1) % BATCH_SAVE == 0:
+        df = pd.DataFrame(results)
+        if not df_existing.empty:
+            df = pd.concat([df_existing, df], ignore_index=True)
+        df.to_csv(OUTPUT_CSV, index=False)
+        print(f"Saved {i + 1} products to {OUTPUT_CSV}")
 
-            founders = extract_founder_info(product_url) if USE_FALLBACK_HTML else ""
-
-            products.append({
-                "product_name": product_name,
-                "product_website": website,
-                "year": year,
-                "founders_info": founders,
-                "product_url": product_url
-            })
-
-            total_fetched += 1
-            if total_fetched % BATCH_SAVE == 0:
-                append_to_csv(products)
-                products = []
-
-            if total_fetched >= COMPANY_LIMIT:
-                break
-            time.sleep(DELAY_SECONDS)
-        page += 1
-
-    # Save remaining batch
-    if products:
-        append_to_csv(products)
-
-    print(f"Scraping complete. Total fetched: {total_fetched}")
-
-if __name__ == "__main__":
-    main()
+# Final save
+if results:
+    df = pd.DataFrame(results)
+    if not df_existing.empty:
+        df = pd.concat([df_existing, df], ignore_index=True)
+    df.to_csv(OUTPUT_CSV, index=False)
+    print(f"Scraping complete. Total fetched: {len(results)}")
+else:
+    print("Scraping complete. Total fetched: 0")
